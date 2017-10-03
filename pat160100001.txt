@@ -1,0 +1,646 @@
+# Patch PAT160100001 created at Thu Sep 14 16:20:09 2017
+# IPL Custom Patch PAT160100001 created by Rob Aylsworth
+# Patch repects document versions in collections when creating transmittal
+m {'kernel','transmittal'}
+o {'pat160000001::Transmittal',&&transmittal::TransmittalLLNode::Transmittal}
+N Transmittal
+f NodeCreateSubclassPost
+s
+
+function Assoc NodeCreateSubclassPost(\
+		DAPINODE	node,\
+		Dynamic		createInfo,\
+		Dynamic		context )
+		
+		Assoc		rtnval
+		Dynamic		apiError
+		String		errMsg
+		Dynamic		status
+		Assoc		formCreateInfo
+		Object		llnode
+		DAPINODE	formNode
+		List		folders
+		Integer		i
+		Integer		j
+		String		query
+		DAPINODE	template
+		DAPINODE	docTemplate
+		Record		parentMetadata
+		Record		metadata
+		Assoc		defaultValues
+		Assoc		schema
+		Assoc		formData
+		DAPINODE	newNode
+		List		newNodes
+		List		subTypes
+		Integer		versionNum
+		Integer		major
+		Integer		minor
+		Assoc		attrData
+		Record		nodeRec
+		DAPINODE	docFolder
+		Assoc		folderCreateInfo
+		Record		rec
+		Integer		projectId
+		
+		Record		request		= createInfo.Request
+		Boolean		ok			= TRUE
+		List		names		= { "Header", "Documents", "Recipients", "Attachments" } // DO NOT XLATE
+		Object		dapiCtx		= createInfo.DapiCtx
+		Object		dbConnect	= dapiCtx.fDbConnect
+		Object		prgCtx		= dapiCtx.fPrgCtx
+
+		INTEGER hIDS,hi,v
+		Dynamic hkey
+		String  dueDate = Undefined
+		
+		if IsFeature( request, 'ProjectID' ) 
+			projectId = Str.StringToValue( request.ProjectID )
+		end
+	
+		//
+		// Contents of the transmittal are stored in three folders:
+		// 1. Header
+		// 2. Documents
+		// 3. Recipients
+		// 4. Attachments
+		//
+		// This allows us to easily find information related to each step of the wizard.
+		//
+		// Here we allocate and create the folders
+		//
+		llnode = $LLIAPI.LLNodeSubsystem.GetItem( $TypeFolder )
+		for i = 1 to Length( names )
+		//ignore Object permissions on folder
+		 prgCtx = $Transmittal.Utils.GetPrgCtx()		
+		createInfo.dapiCtx=prgCtx.fDSession
+			status = llnode.NodeAlloc( createInfo.AssocNode, names[ i ] )
+			if ( !status.OK )
+				ok = FALSE
+				rtnval = status
+				break
+			end // if
+	
+			folders[ i ] = status.Node
+			folderCreateInfo = Assoc.CreateAssoc()
+			folderCreateInfo.InheritNode = createInfo.AssocNode
+			
+			status = llnode.NodeCreate( folders[ i ], createInfo.AssocNode, folderCreateInfo )
+			if ( !status.OK )
+				ok = FALSE
+				rtnval = status
+			end // if
+		end // for
+	
+		if ( ok )
+			status = $LLIAPI.LLNodeSubsystem.GetItem( $TypeTransmittalList ).GetMetadata( createInfo.Parent )
+			if ( !status.OK )
+				ok = FALSE
+				rtnval = status
+			else
+				parentMetadata = status.Metadata
+			end // if
+		end // if
+		
+		if ( ok )
+			status = DAPI.GetNodeByID( dapiCtx.fSession, parentMetadata.header_template_id )
+			if ( IsError( status ) )
+				ok = FALSE
+				errMsg = [TRANSMITTAL_ERRMSG.CouldNotGetHeaderFormTemplate]
+				apiError = status
+			else
+				template = status
+			end // if 
+		end // if
+	
+		//
+		// Get the information from the transmittal list we need in order to create the transmittal
+		//
+		if ( ok )
+			status = $LLIAPI.LLNodeSubsystem.GetItem( $TypeTransmittalList ).GetMetadata( createInfo.Parent )
+			if ( !status.OK )
+				ok = FALSE
+				rtnval = status
+			else
+				formCreateInfo.TemplateID = template.pID
+				if ( IsDefined( status.Metadata.header_view_id ) && status.Metadata.header_view_id > 0 )
+					status = DAPI.GetNodeByID( dapiCtx.fSession, parentMetadata.header_view_id )
+					if ( IsError( status ) )
+						ok = FALSE
+						errMsg = [TRANSMITTAL_ERRMSG.CouldNotGetHeaderFormView]
+						apiError = status
+					else
+						formCreateInfo.FormView = status.pName
+					end // if
+				else
+					formCreateInfo.FormView = status.pName
+				end // if
+			end // if
+		end // if
+		
+		//
+		// If there is a database table for the form template, then use SQL table storage;
+		// otherwise store it as a Content Server version.
+		//
+		if ( ok )	
+			status = $FormAPI.FormTemplatePkg.GetTemplateSQLTableName( template )
+	
+			if ( !status.OK )
+				ok = FALSE
+				rtnval = status
+			else
+				if ( IsDefined( status.SQLTableName ) )
+					formCreateInfo.StorageMech = 2
+					formCreateInfo.SubmitMech = 0
+				else
+					formCreateInfo.StorageMech = 1
+					formCreateInfo.SubmitMech = 0
+				end // if
+			end // if
+		end // if
+		
+		if ( ok )
+			status = $FormAPI.FormTemplatePkg.GetTemplateFieldInfo( template )		
+			if ( !status.OK )
+				ok = FALSE
+				rtnval = status
+			else
+				schema = status.Schema
+			end // if
+		end // if
+		
+		//
+		// There is always a header form, and we create it in the Header folder.
+		//	
+		llnode = $LLIAPI.LLNodeSubsystem.GetItem( $TypeForm )
+		if ( ok )
+			status = llnode.NodeAlloc( folders[ 1 ], "Header Form" ) // DO NOT XLATE
+			if ( !status.OK )
+				ok = FALSE
+				rtnval = status
+			else
+				formNode = status.node
+			end // if
+		end // if
+	
+		if ( ok )
+			defaultValues = parentMetadata.header_default_vals
+			formData.dataAssoc = $Kernel.DataTools.DeepCopy( schema.ValueTemplate )
+			for i = 1 to Length( schema.Children )
+				if ( Assoc.IsKey( defaultValues, schema.Children[ i ].ID ) )
+					if ( schema.Children[ i ].Type == $AttrTypeSet )
+						for j = 1 to Length( schema.Children[ i ].Children )
+							if ( Assoc.IsKey( defaultValues.( schema.Children[ i ].ID )[ 1 ], schema.Children[ i ].Children[ j ].ID ) )
+								formData.DataAssoc.Values[ 1 ].( schema.Children[ i ].ID ).Values[ 1 ].( schema.Children[ i ].Children[ j ].ID ).Values = defaultValues.( schema.Children[ i ].ID )[ 1 ].( schema.Children[ i ].Children[ j ].ID )
+							end
+						end
+					else
+						formData.DataAssoc.Values[ 1 ].( schema.Children[ i ].ID ).Values = defaultValues.( schema.Children[ i ].ID )
+					end
+				end
+			end
+
+	
+		if(IsFeature(request,"headerformdata"))
+		
+	
+		
+		for hi = 1 to Length( schema.Children )
+		
+		for hkey in Assoc.Keys(request.headerformdata[ 1 ][ 1 ].attribs)
+		
+		
+		if(hkey==schema.Children[hi].DisplayName)
+		
+		hIDS=schema.Children[hi].ID
+		
+		echo(request.headerformdata[ 1 ][ 1 ].attribs.(hkey))
+		
+		
+		echo(formData.dataAssoc.Values[ 1 ].(hIDS).Values[1])
+		
+		//formData.dataAssoc.Values[ 1 ].(hIDS).Values[1]=request.headerformdata[ 1 ][ 1 ].attribs.(hkey)
+		
+		if(schema.Children[ hi ].Type==301)
+		
+		String originaldate = request.headerformdata[ 1 ][ 1 ].attribs.(hkey)			
+				
+		string parseddate=""
+		for v=5to length(originaldate)
+		
+		parseddate+=originaldate[v]
+
+		end
+
+
+		Date def = Date.StringToDate( parseddate, "%b %d %H:%M:%S %Y" )
+		
+		formData.dataAssoc.Values[ 1 ].(hIDS).Values[1]=def
+		elseif (schema.Children[ hi ].Type==300)			
+			formData.dataAssoc.Values[ 1 ].(hIDS).Values[1]=STR.StringToValue(request.recipientformdata[ 1 ][1 ].attribs.(hkey))
+		
+		else
+		formData.dataAssoc.Values[ 1 ].(hIDS).Values[1]=request.headerformdata[ 1 ][ 1 ].attribs.(hkey)
+		
+		end
+		
+		end
+		
+		end
+		end
+		
+		end
+						
+			formData.LL_TemplateVersion = template.pVersionNum
+			formData.Content = Assoc.CreateAssoc()
+			formData.Content.RootSet = schema
+			
+			status = $LLIAPI.CacheUtil.New( prgCtx, formData, 5 )
+			if ( !status.OK )
+				ok = FALSE
+				rtnval = status
+			else
+				formCreateInfo.FormCacheID = status.ObjectID
+			end // if
+		end // if
+			
+		if ( ok )
+			status = llnode.NodeCreate( formNode, folders[ 1 ], formCreateInfo )
+			if ( !status.OK )
+				ok = FALSE
+				rtnval = status
+			end // if
+		end // if
+	
+		//
+		// Clean up the cache.
+		//	
+		$LLIAPI.CacheUtil.Delete( prgCtx, formCreateInfo.FormCacheID )
+
+		
+	if ( ok )
+		if(IsFeature(request,"status"))
+			if(request.status!='1')
+	
+				if(IsFeature(request,"comments"))
+	
+					query = "INSERT INTO trans_data ( trans_id, status,comments, header_folder_id, doc_folder_id, recip_folder_id, attach_folder_id,coversheet_id ,issued_for_reason, project_id ) VALUES ( :A1, :A2, :A3, :A4, :A5, :A6, :A7,:A8,:A9,:A10 )"
+					status = CAPI.Exec( dbConnect.fConnection, query, node.pID, CreateInfo.request.status,CreateInfo.request.comments, folders[ 1 ].pID, folders[ 2 ].pID, folders[ 3 ].pID, folders[ 4 ].pID, parentMetadata.coversheet_id,CreateInfo.request.ISR, projectId )
+	
+				else
+					query = "INSERT INTO trans_data ( trans_id, status, header_folder_id, doc_folder_id, recip_folder_id, attach_folder_id,coversheet_id,issued_for_reason, project_id ) VALUES ( :A1, :A2, :A3, :A4, :A5, :A6,:A7,:A8, :A9 )"
+					status = CAPI.Exec( dbConnect.fConnection, query, node.pID, CreateInfo.request.status, folders[ 1 ].pID, folders[ 2 ].pID, folders[ 3 ].pID, folders[ 4 ].pID, parentMetadata.coversheet_id,CreateInfo.request.ISR, projectId )
+	
+				end
+			else
+				if(IsFeature(request,"comments"))
+		
+					query = "INSERT INTO trans_data ( trans_id, status,comments, header_folder_id, doc_folder_id, recip_folder_id, attach_folder_id,issued_for_reason, project_id ) VALUES ( :A1, :A2, :A3, :A4, :A5, :A6,:A7,:A8, :A9 )"
+					status = CAPI.Exec( dbConnect.fConnection, query, node.pID, CreateInfo.request.status,CreateInfo.request.comments, folders[ 1 ].pID, folders[ 2 ].pID, folders[ 3 ].pID, folders[ 4 ].pID,CreateInfo.request.ISR, projectId)
+	
+				else
+					query = "INSERT INTO trans_data ( trans_id, status, header_folder_id, doc_folder_id, recip_folder_id, attach_folder_id, project_id ) VALUES ( :A1, :A2, :A3, :A4, :A5, :A6, :A7 )"
+					status = CAPI.Exec( dbConnect.fConnection, query, node.pID, CreateInfo.request.status, folders[ 1 ].pID, folders[ 2 ].pID, folders[ 3 ].pID, folders[ 4 ].pID, projectId)
+	
+				end
+			end
+		else
+			query = "INSERT INTO trans_data ( trans_id, status, header_folder_id, doc_folder_id, recip_folder_id, attach_folder_id, project_id) VALUES ( :A1, :A2, :A3, :A4, :A5, :A6, :A7 )"
+			status = CAPI.Exec( dbConnect.fConnection, query, node.pID, 1, folders[ 1 ].pID, folders[ 2 ].pID, folders[ 3 ].pID, folders[ 4 ].pID, projectId )
+		end
+		if ( IsError( status ) )
+			ok = FALSE
+			errMsg = [TRANSMITTAL_ERRMSG.CouldNotInsertMetadataIntoTheDatabase]
+			apiError = status
+		end // if
+	end // if
+		
+		// 
+		// Store metadata in the trans_data table.
+		//
+		/*
+
+		if ( ok )
+			query = "INSERT INTO trans_data ( trans_id, status, header_folder_id, doc_folder_id, recip_folder_id, attach_folder_id ) VALUES ( :A1, :A2, :A3, :A4, :A5, :A6 )"
+			status = CAPI.Exec( dbConnect.fConnection, query, node.pID, 1, folders[ 1 ].pID, folders[ 2 ].pID, folders[ 3 ].pID, folders[ 4 ].pID )
+			if ( IsError( status ) )
+				ok = FALSE
+				errMsg = [TRANSMITTAL_ERRMSG.CouldNotInsertMetadataIntoTheDatabase]
+				apiError = status
+			end // if
+		end // if
+
+		*/
+		
+		//
+		// Get the form template and schema so that we can map cat/att values into the documents
+		// array.  
+		// 
+		// Possible issue: what happens if the form template is changed on the transmittal list
+		// after the transmittal has been created?
+		//					
+		if ( ok )
+			status = DAPI.GetNodeByID( dapiCtx.fSession, parentMetadata.doc_template_id )	
+			if ( IsNotError( status ) )
+				template = status
+			else
+				ok = FALSE
+				apiError = status
+				errMsg = [TRANSMITTAL_ERRMSG.CouldNotGetDocumentFormTemplate]
+			end
+		end // if
+		
+		if ( ok )
+			status = $FormAPI.FormTemplatePkg.GetTemplateFieldInfo( template )
+			if ( status.OK )
+				schema = status.Schema
+			else
+				ok = FALSE
+				rtnval = status
+			end
+		end
+	
+		//
+		// Add the documents if created from a source.
+		//
+		if ( ok && Length( createInfo.sources ) > 0 )
+	
+			//---------------------------------------------------------------------------------
+			//do this once so the AddDocument can reuse it
+			//
+			// Get the metadata for this transmittal so that we can find the documents folder.
+			//
+			if ( ok )
+				status = .GetMetadata( node )
+				if ( !status.OK )
+					ok = FALSE
+					rtnval = status
+				else
+					metadata = status.Metadata
+				end // if
+			end // if
+			
+			//
+			// Load the documents folder.  This is where we will create the generation
+			// and the form.
+			//
+			if ( ok )
+				status = DAPI.GetNodeByID( dapiCtx.fSession, metadata.doc_folder_id )
+				if ( IsError( status ) )
+					ok = FALSE
+					errMsg = [TRANSMITTAL_ERRMSG.CouldNotGetDocumentsFolder]
+					apiError = status
+				else
+					docFolder = status
+				end // if
+			end // if
+			
+		//
+		// Get the form template
+		//
+		if ( ok )
+			status = DAPI.GetNodeByID( dapiCtx.fSession, parentMetadata.doc_template_id )
+			if ( IsError( status ) )
+				ok = FALSE
+				errMsg = [TRANSMITTAL_ERRMSG.CouldNotGetDocumentFormTemplate]
+				apiError = status
+			else
+				docTemplate = status
+			end // if
+		end // if
+			
+			//---------------------------------------------------------------------------------
+	
+			subTypes = $LLIAPI.LLNodeSubsystem.GetItem( createInfo.Parent.pSubType ).GetValidSubTypes( createInfo.Parent )
+			
+			// Sigh.  The Collection NodeListContents assumes that request has a 'sort' parameter.
+			request = $LLIAPI.RecArrayPkg.AddFieldsToRecord( request, { 'sort' } )	
+	
+			for i = 1 to Length( createInfo.sources )
+				status = DAPI.GetNodeByID( dapiCtx.fSession, createInfo.sources[ i ] )
+				if ( IsNotError( status ) )
+					newNode = status
+						
+					newNodes = {}
+					
+					if ( !( newNode.pSubType in { $TypeFolder, $TypeCollection, 31066, 848 } ) )
+						newNodes = { newNode.pID }
+					elseif ( Length( subTypes ) > 0 )
+						if ( $TypeFolder == newNode.pSubType ) 
+							query = Str.Format( "SubType IN (%1)", Str.Catenate( subTypes, "," )[ : -2] )
+							status = $LLIAPI.LLNodeSubsystem.GetItem( newNode.pSubType ).NodeListContents( newNode, 'DTree', query, $PSee )
+							if ( status.OK )
+								newNodes = RecArray.ColumnToList( status.Contents, 'DataID' )
+							else
+								ok = FALSE
+								rtnval = status
+								break
+							end
+						elseif ( 31066 == newNode.pSubType || 848 == newNode.pSubType )// For Binders or Business workspaces
+							query = Str.Format( "SubType IN (%1)", Str.Catenate( subTypes, "," )[ : -2] )			
+							integer pid = 	-newNode.pID		
+							
+							DAPINODE nodeIdNode = DAPI.GetNodeByID( dapiCtx.fSession, DAPI.BY_DATAID, pid)					
+							status = $LLIAPI.LLNodeSubsystem.GetItem( newNode.pSubType ).NodeListContents( nodeIdNode, 'DTree', query, $PSee )						
+						
+							if ( status.OK )
+								newNodes = RecArray.ColumnToList( status.Contents, 'DataID' )
+							else
+								ok = FALSE
+								rtnval = status
+								break
+							end
+						elseif ( $TypeCollection == newNode.pSubType )
+							query = 'a.DataID IN ( SELECT Collections.DataID FROM Collections WHERE Collections.CollectionID = :A1 )'
+							status = $LLIAPI.NodeUtil.ListNodes( prgCtx, query, { newNode.pID } )
+	
+							if ( status.OK )
+								for rec in status.contents
+									if ( rec.SubType in subTypes )
+										newNodes = { @newNodes, rec.DataID }
+									end
+								end
+							else
+								ok = FALSE
+								rtnval = status
+								break
+							end
+						end
+					end
+					
+					if IsDefined($LIFECYCLE) AND IsDefined(parentMetadata.validatestate) AND parentMetadata.validatestate == 1
+						List tempList = newNodes
+						newNodes = {}
+						Integer docId
+						for docId in tempList
+							ok  = $LifeCycle.Utils.ValidatePFStateToAllowTransmittals(prgCtx,docId)
+							if ok
+								newNodes = {@newNodes, docId}
+							end
+						end
+					end
+					
+					//check due date display enabled for new transmittal
+					if parentMetadata.calc_duedate_create == 1
+						if ( IsDefined( parentMetadata.duration ) && parentMetadata.duration > 0 )
+							Date dDate =  date.now()
+							dDate = Date.DateInteger( dDate, Date.DateInteger( dDate ) + parentMetadata.duration )
+							dueDate = Date.DateToString(dDate,$Kernel.Systempreferences.GetPrefLocale('ShortDateFormat'))
+						end
+					end
+					
+					if ( ok )
+						/////////////////////////////////////////////////////////////
+						//IPL Custom Patch PAT160100001
+						//Reload the source to ensure it's a collection later
+						Boolean isCollection = false
+						if ( Length( createInfo.sources ) == 1 )
+							Dynamic sourceNode = DAPI.GetNodeByID( dapiCtx.fSession, createInfo.sources[ 1 ] )
+
+							if ( !IsError(sourceNode) && sourceNode.pSubType == $TypeCollection)
+								isCollection = true
+							end
+						end
+						/////////////////////////////////////////////////////////////
+
+
+						for j = 1 to Length( newNodes )
+							// Update the projectid if its not updated earlier, this will happen when the user tries to create transmittal using make transmittal option.
+							// Using the projectid of the first controlled document, ignoring vault documents
+							if ( IsDefined( $CRT ) &&
+								   IsDefined( metadata ) &&
+								   IsFeature( metadata, 'project_id' ) &&
+								   ( IsUnDefined( metadata.project_id ) || metadata.project_id == 0 ) )
+
+								query = 
+									"SELECT PROJECTID FROM CRT_REVISION WHERE LLObjID = :A1 OR LLProjectObjID = :A2 ORDER BY RevisionNumber DESC"
+								Dynamic		dbResults		 = CAPI.Exec( dbConnect.fConnection, query, newNodes[ j ], newNodes[ j ] )
+
+								if ( IsNotError( dbResults ) && Length( dbResults ) > 0 )
+
+									query = "UPDATE trans_data SET project_id = :A1 WHERE trans_id = :A2"
+									CAPI.Exec( dbConnect.fConnection, query, dbResults[ 1 ].PROJECTID, node.pID )
+									metadata.project_id = dbResults[ 1 ].PROJECTID
+
+								end
+							end
+							
+							status = $Transmittal.Utils.GetObjectInfo( prgCtx, newNodes[ j ] )
+							if ( status.OK )
+								if ( $TypeCompoundDoc == status.NodeRec.SubType && Length( status.Releases ) == 0 )
+									continue
+								end
+	
+								nodeRec		= status.NodeRec
+								newNode		= status.Node
+								
+								if ( Length( status.Releases ) > 0 )
+									versionNum = status.Releases[ -1 ].NodeRec.DataID
+								/////////////////////////////////////////////////////////////
+								//IPL Custom Patch PAT160100001
+								//Only catch objects that are documents with more than 1 version going into a collection
+								elseif ( isCollection && newNode.pSubType == $TypeDocument && newNode.pVersionNum > 1 )
+									echo("PAT160100001 - checking version in collection for DataID=", newNode.pID)
+									Dynamic ra = CAPI.Exec( dbConnect.fConnection, "select Version from Collections where CollectionID=:A1 and DataID=:A2 and Version is not null", createInfo.sources[ 1 ], newNode.pID )
+
+									if ( !IsError(ra) && Length(ra) > 0 )
+										versionNum = ra[1].Version
+									else
+										versionNum = nodeRec.VersionNum
+									end
+								/////////////////////////////////////////////////////////////								
+								else
+									versionNum = nodeRec.VersionNum
+								end
+								
+								if ( nodeRec.IsMajorMinor )
+									major = nodeRec.Major
+									minor = nodeRec.Minor
+								else
+									major = UNDEFINED
+									minor = UNDEFINED
+								end
+	
+								status = $TRANSMITTAL.Utils.GetAttrData( prgCtx, newNode )
+								if ( status.OK )
+									attrData	= status.AttrData						
+									if IsDefined(dueDate)
+										status = $Transmittal.Utils.MapDocumentData( prgCtx, newNode, versionNum, attrData, schema, parentMetadata.doc_mapping, "_1_1", undefined, dueDate )
+									else
+										status = $Transmittal.Utils.MapDocumentData( prgCtx, newNode, versionNum, attrData, schema, parentMetadata.doc_mapping )
+									end
+									if ( status.OK )
+										formData = Assoc.CreateAssoc()
+										formData.LL_TemplateVersion = template.pVersionNum
+										formData.DataAssoc = $Kernel.DataTools.DeepCopy( schema.ValueTemplate )
+										Assoc parm = Assoc.CreateAssoc()
+										parm.dapiCtx = dapiCtx
+										parm.node = node
+										parm.dataID =newNodes[ j ]
+										parm.versionNum = versionNum
+										parm.major = major
+										parm.minor = minor
+										parm.versionType = UNDEFINED
+										parm.formData = formData
+										parm.checkRequired = FALSE
+										parm.docTemplate = docTemplate
+										parm.docFolder = docFolder
+										status = $Transmittal.Utils.AddDocument( parm )
+	//									status = .AddDocument( dapiCtx, node, newNodes[ j ], versionNum, major, minor, UNDEFINED, formData, FALSE )
+										if ( !status.OK )
+											ok = FALSE
+											rtnval = status
+										end
+									end
+								else
+									ok = False
+									rtnval = status
+									break
+								end
+							else
+								ok = FALSE
+								rtnval = status
+								break
+							end
+						end
+					else
+						break
+					end
+				else
+					ok = FALSE
+					apiError = status
+					errMsg = [TRANSMITTAL_ERRMSG.CouldNotGetTransmittalSource]
+				end
+			end
+		end
+		
+		//
+		// The count of transmittals within the list is stored in pExAtt1 on the Transmittal List node.
+		// This function will update that count, adding one for the new transmittal.
+		//
+		if ( ok )
+			status = $Transmittal.TransmittalListUtils.UpdateTransmittalListCount( dapiCtx, node.pParentID )
+			if ( !status.OK )
+				ok = FALSE
+				rtnval = status
+			end
+		end // if
+	
+		if ( ok )
+			status = $Transmittal.Utils.UpdateTransmittalCount( dapiCtx, node.pID )
+			if ( !status.OK )
+				ok = FALSE
+				rtnval = status
+			end
+		end // if
+		
+		if IsUndefined( rtnval.OK )
+			rtnval.OK = ok
+			rtnval.ErrMsg = errMsg
+			rtnval.ApiError = apiError
+		end
+		
+		return( rtnval )
+	end
+
+sEND
